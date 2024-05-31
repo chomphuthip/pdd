@@ -26,7 +26,7 @@
 
 #define pdd_vec_resize(vec, new_capacity) \
     ((vec).capacity = (new_capacity), \
-    (vec).buf = (*type)realloc((vec).buf, sizeof((vec).unit_size * (vec).capacity))
+    (vec).buf = realloc((vec).buf, sizeof((vec).unit_size * (vec).capacity))
 
 #define pdd_vec_push(vec, val) \
     do { \

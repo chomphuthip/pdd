@@ -102,25 +102,28 @@ void pdd_stream_delete(pdd_stream_t* stream) {
 
 
 /*
-   Hash Map Implementation
+    Hash Map Implementation
 
-   Hashing
-       32bv uses random bitshifting
-       str uses FNV-1a
-       byte strings use FNV-1a
+    Hashing
+        32bv are modulo'd
+        str uses FNV-1a
+        byte strings use FNV-1a with a fixed length
 
     Collision Handling
         Open Addressing with linear probing
         Resize upon 75% load
         Parallel array with bit flags
             first bit: if bucket is in use
-            bottom 31: fibonacci hash to verify correct key
+            remainder: last 7 bits xored against hash
             
+
+        chance for an fnv collision & having the same last 7 bits is 1 in 2^39
+
 */
 
-struct _pdd_map_flags {
-    int in_use: 1;
-    int hash: 31;
+struct _pdd_map_md_t {
+    unsigned char in_use: 1;
+    unsigned char discriminant: 7;
 };
 
 enum pdd_map_type {
@@ -129,33 +132,122 @@ enum pdd_map_type {
     // if using byte strings, specify a fixed byte length
 };
 
-uint32_t pdd_map_32bv_hash(uint32_t to_hash) {
+// based on https://lemire.me/blog/2016/06/27/a-fast-alternative-to-the-modulo-reduction/ 
+uint32_t _pdd_map_fast_range(uint32_t val, uint32_t max) {
+    return ((uint64_t) val * (uint64_t) max) >> 32;
+}
 
+uint32_t _pdd_map_fnv(char* input, size_t len) {
+    uint32_t res;
+
+    res = 2166136261 //fnv offset basis
+    for(int i = 0; i < len; i++) {
+        res ^= input[i];
+        res *= 16777619 //fnv prime
+    }
+
+    return res;
+}
+
+unsigned char _pdd_map_calc_discriminant(unsigned char first_byte, uint32_t hash) {
+    return (hash ^ first_byte) & 0b1111111;
 }
 
 #define pdd_map_typedef(type_name, prefix, key_t, val_t, map_type) \
     typedef struct type_name { \
-        uint32_t (*hash_func)(*void to_hash); \
         size_t key_len; \
-                        \
-        uint32_t*  flags; \
-        val_t* keys; \
+                    \
+        size_t len; \
+        size_t load; \
+        val_t* values; \
+        _pdd_map_md_t* metadata; \
     } type_name; \
                  \
     type_name* prefix##_new() { \
         type_name* new_map; \
-                            \
+        \
         new_map = calloc(1, sizeof(type_name)); \
-                                                \
-        if(map_type == -1) new_map->hash_func = pdd_map_32bv_hash \
-        else if(map_type == 0) new_map->hash_func = pdd_map_string_hash \
+        \
+        if(map_type == -1) new_map->hash_func = pdd_map_32bv_hash; \
+        else if(map_type == 0) new_map->hash_func = pdd_map_string_hash; \
         else { \
             new_map->hash_func = pdd_map_string_hash; \
             new_map->key_len = map_type; \
         } \
-        return new_map \
+        \
+        return new_map; \
     } \
-      \
+    \
+    uint32_t prefix##_hash(type_name* map, key_t key) { \
+        switch(map_type) { \
+            case pdd_map_32bv: \
+                return key; \
+            case pdd_map_str: \
+                return _pdd_map_fnv(key, strlen(key)); \
+            default: \
+                return _pdd_map_fnv(key, map->key_len); \
+        } \
+    \
+    uint32_t prefix##_naive_index(type_name* map, key_t key) { \
+        return _pdd_map_fast_range(prefix##_hash(map, key)); \
+    } \
+    \
+    /* fbof: first byte of key*/ \
+    unsigned char prefix##_fbof(key_t key) { \
+        return map_type == pdd_map_32bv ? (unsigned char)key : (unsigned char)(*key); \
+    } \
+    \
+    val_t* prefix##_get_ref(type_name* map, key_t key) { \
+        uint32_t index; \
+        uint32_t metadata; \
+        size_t dist_traveled; \
+        unsigned char discriminant; \
+        \
+        index = prefix##_naive_index(map, key); \
+        end = index; \
+        \
+        metadata = map->metadata[index]; \
+        if(metadata.in_use == 0) return 0; \
+        \
+        discriminant = _pdd_map_calc_discriminant(prefix##_fbof(key), \
+                _pdd_map_hash(map, key)); \
+        \
+        dist_traveled = 0; \
+        while (metadata.discriminant != discriminant) { \
+            if(index == map->len) index = 0; \
+            if(dist_traveled == map->len) return 0; \
+            metadata = map->metadata[++index]; \
+            dist_traveled++; \
+        } \
+        \
+        return &values[index]; \
+    } \
+    \
+    val_t prefix##_get(type_name* map, key_t key) { \
+        val_t empty; \
+        val_t res; \
+        \
+        empty = {0}; \
+        res = prefix##_get_ref(map, key); \
+        return res == 0 ? empty : res; \
+    } \
+    \
+    void prefix##_grow(type_name* map) { \
+        size_t space_to_init; \
+        size_t buf_to_init; \
+        size_t metadata_to_init; \
+        \
+        space_to_init = map->len; \
+        map->len = map->len * 2; \
+        map->buf = realloc(map->buf, map->len * sizeof(val_t)); \
+        map->metadata = realloc(map->metadata, map->len * sizeof(_pdd_map_md_t)); \
+        \
+        buf_to_init = space_to_init * sizeof(val_t); \
+        metadata_to_init = space_to_init * sizeof(_pdd_map_md_t); \
+        \
+        memset(map->buf + buf_to_init, 0, buf_to_init); \
+        memset(map->metadata + metadata_to_init, 0, metadata_to_init); \
+    } \
 
 
 #endif // PDD_H

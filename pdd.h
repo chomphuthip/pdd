@@ -47,12 +47,7 @@ typedef struct {
     size_t pos;
 } pdd_stream_t;
 
-pdd_stream_t* pdd_stream_new(size_t size) {
-    pdd_stream_t* stream; 
-
-    stream = malloc(sizeof(*stream));
-    if(!stream) return 0;
-
+int pdd_stream_init(pdd_stream_t* stream, size_t size) {
     stream->buf = malloc(size);
     if(!stream->buf) {
         free(stream);
@@ -61,6 +56,15 @@ pdd_stream_t* pdd_stream_new(size_t size) {
 
     stream->capacity = size;
     stream->pos = 0;
+}
+
+pdd_stream_t* pdd_stream_new(size_t size) {
+    pdd_stream_t* stream; 
+
+    stream = malloc(sizeof(*stream));
+    if(!stream) return 0;
+
+    pdd_stream_init(stream, size);
     return stream;
 }
 
@@ -109,18 +113,16 @@ void pdd_stream_delete(pdd_stream_t* stream) {
     Hashing
         lit uses Wang
         str uses FNV-1a
-        byte strings use FNV-1a with a fixed length
 
     Collision Handling
         Open Addressing with linear probing
 
     Architecture
-        Array of key pointers (string keys get pointer to pointers)
+        Array of keys
         Array of values 
 
         Hash to get naive index
         If isnt correct, linear probe key list
-        If an index is not in use, its key pointer will be 0;
 
     Resizing
         allocate new index array
@@ -148,7 +150,7 @@ uint32_t _pdd_map_fnv(char* input, size_t len) {
     return res;
 }
 
-uint32_t _pdd_map_wang(uintptr_t input) {
+uint32_t _pdd_map_wang(uint32_t input) {
     input += ~(input << 15);
     input ^=  (input >> 10);
     input +=  (input << 3);
@@ -158,191 +160,180 @@ uint32_t _pdd_map_wang(uintptr_t input) {
     return input;
 }
 
-enum pdd_map_key_len {
-    pdd_map_type_lit = -1,
-    pdd_map_type_str = 0,
-    // otherwise, specifiy fixed key length of byte string 
+enum pdd_map_key_type {
+    pdd_map_key_lit = -1,
+    pdd_map_key_str = 0,
 };
 
-#define pdd_map_typedef(type_name, prefix, key_t, val_t, key_len) \
+unsigned char pdd_map_cmp_lit_hash(uint32_t key) {
+    return _pdd_map_wang(key);
+}
+
+unsigned char pdd_map_cmp_lit_cmp(uint32_t key_a, uint32_t key_b) {
+    return key_a == key_b ? 1 : 0;
+}
+
+unsigned char pdd_map_cmp_str_hash(char* key) {
+    return _pdd_map_fnv(key, strlen(key));
+}
+
+unsigned char pdd_map_cmp_str_cmp(char* key_a, char* key_b) {
+    int cmp_1;
+    int cmp_2;
+
+    cmp_1 = (memcmp(key_a, key_b, 
+                strlen(key_a)) == 0) ? 1 : 0; 
+    cmp_2 = (memcmp(key_a, key_b,
+                strlen(key_b)) == 0) ? 1 : 0; 
+    return (cmp_1 && cmp_2) ? 1 : 0; 
+}
+
+#define pdd_map_cmp_byte_decl(len) \
+    unsigned char pdd_map_cmp_byte_hash(char* key) { \
+        return _pdd_map_fnv(key, len); \
+    } \
+    \
+    unsigned char pdd_map_cmp_byte_cmp(char* key_a, char* key_b) { \
+        return (memcmp(key_a, key_b,  \
+                    len) == 0) ? 1 : 0;  \
+    } \
+
+#define pdd_map_typedef(type_name, prefix, key_t, val_t, key_type) \
+    typedef struct type_name##_bucket_t { \
+        char flags; \
+        key_t key; \
+        val_t val; \
+    } type_name##_bucket_t; \
+    \
     typedef struct type_name { \
-        void (*delete_hook)(val_t val); \
-        char* tombstones; \
+        void (*delete_hook)(key_t, val_t); \
         \
         size_t len; \
-        size_t load; \
-        key_t* keys; \
-        val_t* vals; \
+        size_t entries; \
+        type_name##_bucket_t* buckets; \
     } type_name; \
                  \
+    int prefix##_init(type_name* map) { \
+        map->entries = 0; \
+        map->len = 16; \
+        map->buckets = calloc(16, map->len * sizeof(type_name##_bucket_t)); \
+        if(!map->buckets) return -1; \
+        return 0; \
+    } \
     type_name* prefix##_new() { \
+        int res; \
         type_name* new_map; \
         \
-        new_map = calloc(1, sizeof(type_name)); \
-        new_map->load = 0; \
-        new_map->delete_hook = 0; \
+        new_map = calloc(1, sizeof(*new_map)); \
+        if(!new_map) return 0; \
         \
-        new_map->len = 16; \
-        new_map->keys = calloc(new_map->len, sizeof(key_t*)); \
-        new_map->vals = calloc(new_map->len, sizeof(val_t)); \
-        new_map->tombstone = calloc(new_map->len, sizeof(char*)); \
-        \
-        memset(new_map->keys, 0, new_map->len * sizeof(key_t*)); \
-        memset(new_map->vals, 0, new_map->len * sizeof(val_t)); \
-        memset(new_map->tombestone, 0, new_map->len * sizeof(char*)); \
+        res = prefix##_init(new_map); \
+        if(res == -1) { \
+            free(new_map); \
+            return 0; \
+        } \
         \
         return new_map; \
     } \
     \
     uint32_t prefix##_hash(key_t key) { \
-        switch(key_len) { \
-            case pdd_map_type_lit: \
-                return _pdd_map_wang((uintptr_t)key); \
-            case pdd_map_type_str: \
-                return _pdd_map_fnv(key, strlen(key)); \
-            default: \
-                return _pdd_map_fnv(key, key_len); \
-        } \
+        return key_type##_hash(key); \
     } \
-    unsigned char prefix##_keycmp(type_name* map, key_t key_a, key_t key_b) { \
-        char cmp_1; \
-        char cmp_2; \
-        \
-        switch(key_len) { \
-            case pdd_map_type_lit: \
-                return (*key_a == *key_b) ? 1 : 0; \
-            case pdd_map_type_str: \
-                cmp_1 = (memcmp(key_a, key_b, strlen(key_a)) == 0) ? 1 : 0; \
-                cmp_2 = (memcmp(key_a, key_b, strlen(key_b)) == 0) ? 1 : 0; \
-                return (cmp_1 && cmp_2) ? 1 : 0; \
-            default: \
-                return (memcmp(key_a, key_b, key_len) == 0) ? 1 : 0; \
-        } \
-    }\
     \
-    void prefix##_keysave(type_name* map, key_t key, uint32_t index) { \
-        key_t* heap_key; \
-        \
-        switch(key_len) { \
-            case pdd_map_type_lit: \
-                map->tombstones[index] = 1; \
-                map->keys[index] = key; \
-                return; \
-            case pdd_map_type_str: \
-                map->tombstones[index] = 1; \
-                map->keys[index] = strdup(key); \
-                return; \
-            default: \
-                heap_key = malloc(key_len); \
-                memcpy(heap_key, key, key_len) \
-                map->keys[index] = heap_key; \
-                return; \
-        } \
-    }\
+    uint32_t prefix##_cmp(key_t key_a, key_t key_b) { \
+        return key_type##_cmp(key_a, key_b); \
+    } \
     \
     uint32_t prefix##_naive_index(key_t key, uint32_t arr_len) { \
         return _pdd_map_fast_range(prefix##_hash(key), arr_len); \
     } \
     \
+    uint32_t prefix##_new_index(type_name* map, key_t key) { \
+        uint32_t index; \
+        \
+        index = prefix##_naive_index(key, map->len); \
+        while(map->buckets[index].flags != 0) if(++index == map->len) index = 0; \
+        \
+        return index; \
+    } \
+    \
+    int prefix##_cur_index(type_name* map, key_t key) { \
+        uint32_t index; \
+        uint32_t end; \
+        \
+        index = prefix##_naive_index(key, map->len); \
+        end = _pdd_map_fast_range(index + map->len - 2, map->len); \
+        while(map->buckets[index].flags != 0 && \
+                !prefix##_cmp(key, map->buckets[index].key)) { \
+                if(++index == map->len) index = 0; \
+                if(index == end) return -1; \
+        } \
+        \
+        return index; \
+    } \
+    \
     void prefix##_grow(type_name* map) { \
         uint32_t new_len; \
-        uint32_t index; \
-        key_t** new_keys; \
-        val_t* new_vals; \
+        uint32_t new_index; \
+        type_name##_bucket_t* new_buckets; \
         \
-        /* TODO add error checking */ \
         new_len = map->len * 2; \
-        new_keys = calloc(new_len, sizeof(key_t)); \
-        new_vals = calloc(new_len, sizeof(val_t)); \
-        new_tomb = calloc(new_len, sizeof(char)); \
+        new_buckets = calloc(new_len, sizeof(*new_buckets)); \
         \
-        memset(new_keys, 0, (new_len * sizeof(key_t*))); \
-        memset(new_vals, 0, (new_len * sizeof(val_t))); \
-        memset(new_tomb, 0, (new_len * sizeof(char))); \
-        \
-        for(int i = 0; i < new_len; i++) { \
-            if(map->keys[i] == 0) continue; \
-            \
-            index = prefix##_naive_index(*map->keys[i], new_len); \
-            while() { \
-                if(++index == new_len) index = 0; \
-            } \
-            memmove(new_keys + i, map->keys[i], sizeof(key_t)); \
-            memmove(new_vals + i, map->vals[i], sizeof(val_t)); \
-            memmove(new_tomb + i, map->tomb[i], sizeof(char)); \
+        for(int i = 0; i < map->len; i++) { \
+            if(map->buckets[i].flags == 0) continue; \
+            new_index = prefix##_new_index(map, map->buckets[i].key); \
+            memmove(&new_buckets[new_index], &map->buckets[i], \
+                    sizeof(type_name##_bucket_t)); \
         } \
-        free(map->keys); \
-        free(map->vals); \
-        free(map->tombstones); \
         \
-        map->keys = new_keys; \
-        map->vals = new_vals; \
-        map->tombstones = new_tomb; \
+        free(map->buckets); \
+        map->buckets = new_buckets; \
         map->len = new_len; \
-    } \
-    \
-    int prefix##_find_cur_index(type_name* map, key_t key) { \
-        uint32_t index; \
-        uint32_t dist_traveled; \
-        \
-        dist_traveled = 0; \
-        index = prefix##_naive_index(key, map->len); \
-        \
-        while (!prefix##_keycmp(map, key, map->keys[index])) { \
-            if(dist_traveled == map->len) return -1; \
-            if(index == map->len) index = 0; \
-            dist_traveled++; \
-        } \
-        \
-        return index; \
-    } \
-    \
-    int prefix##_find_new_index(type_name* map, key_t key) { \
-        uint32_t index; \
-        \
-        index = prefix##_naive_index(key, map->len); \
-        while(map->tombstones[index] != 0) { \
-            if(++index == map->len) index = 0; \
-        } \
-        \
-        return index; \
     } \
     \
     void prefix##_delete(type_name* map, key_t key) { \
         uint32_t index; \
         \
-        index = prefix##_find_cur_index(map, key); \
+        index = prefix##_cur_index(map, key); \
         if(index == -1) return; \
         \
-        map->delete_hook(map->vals[index]); \
-        \
-        map->tombstones[index] = 0; \
-        free(map->keys[index]); \
-        map->keys[index] = 0; \
-        map->load--; \
-    } \
-    \
-    int prefix##_get(type_name* map, key_t key, val_t* dest) { \
-        uint32_t index; \
-        \
-        index = prefix##_find_cur_index(map, key); \
-        if(index == -1) return -1; \
-        \
-        memcpy(dest, &map->vals[index], sizeof(val_t)); \
-        return 0; \
+        map->buckets[index].flags = 0; \
+        map->delete_hook(map->buckets[index].key, \
+                map->buckets[index].val); \
+        map->entries--; \
     } \
     void prefix##_put(type_name* map, key_t key, val_t val) { \
         uint32_t index; \
         \
-        map->load++; \
-        if((map->load / map->len) * 100 >= 75) prefix##_grow(map); \
+        if(map->entries + 1 > map->len * (3/4)) prefix##_grow(map); \
         \
-        index = prefix##_find_new_index(map, key); \
-        prefix##_keysave(map, key, index); \
-        memcpy(&map->vals[index], val, sizeof(val_t)); \
+        index = prefix##_new_index(map, key); \
+        \
+        map->buckets[index].flags = 1; \
+        map->buckets[index].key = key; \
+        map->buckets[index].val = val; \
+        \
+        map->entries++; \
+    } \
+    int prefix##_get(type_name* map, key_t key, val_t* dest) { \
+        uint32_t index; \
+        \
+        index = prefix##_cur_index(map, key); \
+        if(index == -1) return -1; \
+        \
+        memcpy(dest, &map->buckets[index].val, sizeof(val_t)); \
+        return 0; \
     } \
     \
-    void prefix##_hook_del(type_name* map, void (*delete_hook)(val_t)) { \
+    val_t* prefix##_get_ptr(type_name* map, key_t key) { \
+        uint32_t index; \
+        \
+        index = prefix##_cur_index(map, key); \
+        if(index == -1) return 0; \
+        return &map->buckets[index].val; \
+    } \
+    void prefix##_hook_del(type_name* map, void (*delete_hook)(key_t, val_t)) { \
         map->delete_hook = delete_hook; \
     } \
 

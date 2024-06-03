@@ -113,23 +113,25 @@ void pdd_stream_delete(pdd_stream_t* stream) {
     Hashing
         lit uses Wang
         str uses FNV-1a
+        byte string uses FNV-1a
+
+        you can write your own hash and comparison functions
+            key_type##_hash
+            key_type##_cmp
 
     Collision Handling
         Open Addressing with linear probing
 
     Architecture
-        Array of keys
-        Array of values 
+        Array of buckets
+            bucket has: flag, key, and value
 
         Hash to get naive index
         If isnt correct, linear probe key list
 
     Resizing
-        allocate new index array
-        hash each key and store in corresponding array
-        alloc a new buffer
-        memmcve each key to the new index
-        memmove each value to the new index
+        allocate new bucket array
+        hash each key and memmove bucket to new index in new array
 */
 
 
